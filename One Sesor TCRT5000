@@ -1,0 +1,709 @@
+#include <AccelStepper.h>
+#include <DueTimer.h>
+
+#define sensorPin A0  // Chân analog mà cảm biến TCRT 5000 được kết nối
+int minVal = 1023;
+int maxVal = 0;
+
+float previousX = 0;      // Giá trị trước đó cho đạo hàm
+float threshold = 20;     // Ngưỡng đạo hàm
+float X = 511.5, XX = 0;  // Giá trị ban đầu
+float Q = 31;             // Quá trình noise covariance
+float R = 80;             // Đo noise covariance (có thể điều chỉnh dựa trên nhiễu của cảm biến)
+float P = 15;             // Lỗi ước lượng ban đầu covariance
+float K;                  // Kalman gain
+float mappedSignal = 0;
+// Khai báo các chân điều khiển
+#define stepX1 3
+#define dirX1 2
+#define stepX2 5
+#define dirX2 4
+#define stepY 7
+#define dirY 6
+
+#define enableX1 22
+#define enableX2 23
+#define enableY 24
+
+// Khai báo các chân công tắc hành trình
+#define limitSwitchX 26
+#define limitSwitchY 27
+#define limitSwitchXX 28
+#define limitSwitchYY 29
+
+int num = 0, i = 0, ii = 0;
+float D = 12.2;
+int offset = 350;
+int mi = 3200;               // Số bước cho một vòng
+float n = 30.9;              // Số vòng cần di chuyển
+int a = 10;                  // Gia tốc
+int reverseCountX = 0;       // Biến đếm số lần đảo chiều
+const int maxReversesX = 1;  // Số lần đảo chiều tối đa
+
+int miY = 3200;              // Số bước cho một vòng
+float nY = 22;               // Số vòng cần di chuyển
+int aY = 10;                 // Gia tốc
+int reverseCountY = 0;       // Biến đếm số lần đảo chiều
+const int maxReversesY = 2;  // Số lần đảo chiều tối đa
+
+volatile bool limitSwitchTriggeredX = false;
+volatile bool homingCompleteX = false;
+unsigned long lastDebounceTimeX = 0;
+unsigned long debounceDelayX = 10;  // Độ trễ debounce 10ms
+
+volatile bool limitSwitchTriggeredXX = false;
+volatile bool homingCompleteXX = false;
+unsigned long lastDebounceTimeXX = 0;
+unsigned long debounceDelayXX = 10;  // Độ trễ debounce 10ms
+
+volatile bool limitSwitchTriggeredY = false;
+volatile bool homingCompleteY = false;
+unsigned long lastDebounceTimeY = 0;
+unsigned long debounceDelayY = 10;  // Độ trễ debounce 10ms
+
+volatile bool limitSwitchTriggeredYY = false;
+volatile bool homingCompleteYY = false;
+unsigned long lastDebounceTimeYY = 0;
+unsigned long debounceDelayYY = 10;  // Độ trễ debounce 10ms
+
+// Khai báo 3 động cơ stepper sử dụng thư viện AccelStepper
+AccelStepper stepperX1(AccelStepper::DRIVER, stepX1, dirX1);
+AccelStepper stepperX2(AccelStepper::DRIVER, stepX2, dirX2);
+AccelStepper stepperY(AccelStepper::DRIVER, stepY, dirY);
+
+void limitSwitchISR_X() {
+  unsigned long currentTime = millis();
+  if ((currentTime - lastDebounceTimeX) > debounceDelayX) {
+    noInterrupts();  // Tắt interrupts để tránh xung đột
+    limitSwitchTriggeredX = true;
+    lastDebounceTimeX = currentTime;
+    interrupts();  // Bật lại interrupts
+  }
+}
+
+void limitSwitchISR_XX() {
+  unsigned long currentTime = millis();
+  if ((currentTime - lastDebounceTimeXX) > debounceDelayXX) {
+    noInterrupts();  // Tắt interrupts để tránh xung đột
+    limitSwitchTriggeredXX = true;
+    lastDebounceTimeXX = currentTime;
+    interrupts();  // Bật lại interrupts
+  }
+}
+
+void limitSwitchISR_Y() {
+  unsigned long currentTime = millis();
+  if ((currentTime - lastDebounceTimeY) > debounceDelayY) {
+    noInterrupts();  // Tắt interrupts để tránh xung đột
+    limitSwitchTriggeredY = true;
+    lastDebounceTimeY = currentTime;
+    interrupts();  // Bật lại interrupts
+  }
+}
+
+void limitSwitchISR_YY() {
+  unsigned long currentTime = millis();
+  if ((currentTime - lastDebounceTimeYY) > debounceDelayYY) {
+    noInterrupts();  // Tắt interrupts để tránh xung đột
+    limitSwitchTriggeredYY = true;
+    lastDebounceTimeYY = currentTime;
+    interrupts();  // Bật lại interrupts
+  }
+}
+
+void setup() {
+  Serial.begin(9600);
+  pinMode(sensorPin, INPUT);
+  pinMode(52, OUTPUT);
+  digitalWrite(52, HIGH);
+  // Thiết lập chân ENABLE
+  stepperX1.setEnablePin(enableX1);
+  stepperX2.setEnablePin(enableX2);
+  stepperY.setEnablePin(enableY);
+
+  // Thiết lập chân công tắc hành trình
+  pinMode(limitSwitchX, INPUT_PULLUP);
+  attachInterrupt(digitalPinToInterrupt(limitSwitchX), limitSwitchISR_X, FALLING);
+
+  pinMode(limitSwitchY, INPUT_PULLUP);
+  attachInterrupt(digitalPinToInterrupt(limitSwitchY), limitSwitchISR_Y, FALLING);
+
+  pinMode(limitSwitchXX, INPUT_PULLUP);
+  attachInterrupt(digitalPinToInterrupt(limitSwitchXX), limitSwitchISR_XX, FALLING);
+
+  pinMode(limitSwitchYY, INPUT_PULLUP);
+  attachInterrupt(digitalPinToInterrupt(limitSwitchYY), limitSwitchISR_YY, FALLING);
+
+  safe();
+  // Tự động home động cơ
+  autoHome();
+  enableAllSteppers();
+  delay(500);
+  disableAllSteppers();
+  delay(500);
+  M30();
+  calibSensor(0, 130, 20);
+  // Cấu hình Timer 1 của Arduino Due để gọi hàm readSensor mỗi 50ms (0.05 giây)
+  Timer1.attachInterrupt(infoSensor);  // Đăng ký hàm infoSensor
+  Timer1.start(50000);                 // 50000 microseconds = 50ms
+}
+int ch = 140, chh = 0, PMD = 0, mau = 238, maxA = 1190;
+#define MAX_SIZE 1000  // Định nghĩa kích thước tối đa của mảng
+int historyX[MAX_SIZE];
+int historyY[MAX_SIZE];
+int currentIndex = 0;  // Biến đếm để theo dõi vị trí hiện tại trong mảng
+
+void loop() {
+  if (homingCompleteX && homingCompleteY) {
+    for (int i = 0; i < mau; i++) {
+      int signal = analogRead(sensorPin);
+      mappedSignal = map(signal, minVal * 0.9, maxVal * 1.1, 0, 1023);
+      chh += maxA / mau;
+
+      if (mappedSignal > minVal / 2 + maxVal / 2) {
+        ch += mappedSignal / maxVal * 12;
+      } else {
+        ch -= mappedSignal / maxVal * 12;
+      }
+
+      G1(chh, ch);
+
+      if (currentIndex < MAX_SIZE) {  // Kiểm tra xem có vượt quá kích thước mảng không
+        historyX[currentIndex] = chh;
+        historyY[currentIndex] = ch;
+        currentIndex++;
+      }
+
+      if (mappedSignal > maxVal - 100) {
+        PMD++;
+      } else {
+        PMD = 0;
+      }
+
+      if (PMD == 3) {
+        i = mau;
+      }
+    }
+
+    G28();
+    G1(chh, ch);
+    G28();
+
+    for (int i = 1; i < currentIndex - 1; i++) {
+      G1(historyX[i - 1], historyY[i]);
+    }
+
+    G28();
+    G1(chh, ch);
+    M30();
+  }
+}
+
+// void loop() {
+//   if (homingCompleteX && homingCompleteY) {
+//     for (int i = 0; i < mau; i++) {
+
+//       int signal = analogRead(sensorPin);
+
+//       mappedSignal = map(signal, minVal * 0.9, maxVal * 1.1, 0, 1023);
+//       chh += maxA / mau;
+
+//       if (mappedSignal > minVal / 2 + maxVal / 2) {
+//         ch += mappedSignal / maxVal * 12;
+//         G1(chh, ch);
+//       } 
+//       else {
+//         ch -= mappedSignal / maxVal * 12;
+//         G1(chh, ch);
+//       }
+
+//       if (mappedSignal > maxVal - 100) PMD++;
+//       else PMD = 0;
+      
+//       if (PMD == 3) i = mau;
+//     }
+//     G28();
+//     G1(chh, ch);
+//     G28();
+//     G1(chh, ch);
+//     G28();
+//     G1(chh, ch);
+//     M30();
+//   }
+// }
+
+void infoSensor() {
+  int signal = analogRead(sensorPin);
+  mappedSignal = map(signal, minVal * 0.9, maxVal * 1.1, 0, 1023);
+  Serial.print("analog:");
+  Serial.print(signal);
+  Serial.print(", ");
+  Serial.print("amplifySignal:");
+  Serial.print(mappedSignal);
+  Serial.print(", ");
+  Serial.print("filter:");
+  Serial.println(sensor(mappedSignal));
+}
+
+void calibSensor(int calibx, int caliby, int length) {
+  G1(calibx, caliby);
+  for (int i = 0; i < length; i++) {
+    G1(calibx, caliby - length / 2 + i * 3);
+    int sensorVal = analogRead(sensorPin);
+    Serial.print("Calib:");
+    Serial.println(sensorVal);
+    if (sensorVal < minVal) minVal = sensorVal;
+    if (sensorVal > maxVal) maxVal = sensorVal;
+  }
+
+  Serial.print("Min Value: ");
+  Serial.println(minVal);
+  Serial.print("Max Value: ");
+  Serial.println(maxVal);
+}
+
+int sensor(float signal) {
+  float derivative = abs(signal - previousX);
+
+  // Tính toán Kalman gain
+  K = P / (P + R);
+  // Ước lượng giá trị hiện tại
+  X = X + K * (signal - X);
+  // Cập nhật lỗi ước lượng
+  P = (1 - K) * P + Q;
+
+  if (derivative > threshold)
+    previousX = X;
+
+  return static_cast<int>(previousX);
+}
+
+void info(float targetX, float targetY) {
+  if (stepperX1.distanceToGo() == 0 && stepperX2.distanceToGo() == 0 && stepperY.distanceToGo() == 0) {
+    Serial.print("N");
+    Serial.print(num);
+    Serial.print(": ");
+    Serial.print(stepperX1.currentPosition() / mi * D * 3.14);
+    Serial.print("mm - ");
+    Serial.print(targetX);
+    Serial.print(" - ");
+    Serial.print(stepperY.currentPosition() / mi * D * 3.14);
+    Serial.print("mm - ");
+    Serial.println(targetY);
+    num++;
+  }
+}
+
+void G1(float targetX, float targetY) {
+  // Chuyển đổi tọa độ mục tiêu từ đơn vị đo lường sang số bước
+  targetX = targetX / D / 3.14 * mi;
+  targetY = targetY / D / 3.14 * miY;
+  // Thiết lập tốc độ và gia tốc cho các động cơ
+  setStepperProperties(stepperX1, mi, a);
+  setStepperProperties(stepperX2, mi, a);
+  setStepperProperties(stepperY, miY, aY);
+
+  // Cập nhật vị trí mục tiêu cho các động cơ
+  stepperX1.moveTo(targetX);
+  stepperX2.moveTo(targetX);
+  stepperY.moveTo(targetY);
+
+  runSteppers();
+}
+
+void G2(float xEnd, float yEnd, float iOffset, float jOffset) {
+  // Xác định tâm cung tròn
+  xEnd = xEnd / D / 3.14 * mi;
+  yEnd = yEnd / D / 3.14 * miY;
+  iOffset = iOffset / D / 3.14 * mi;
+  jOffset = jOffset / D / 3.14 * miY;
+  float xStart = stepperX1.currentPosition();
+  float yStart = stepperY.currentPosition();
+  float xCenter = xStart + iOffset;
+  float yCenter = yStart + jOffset;
+
+  // Bán kính của cung tròn
+  float radius = sqrt(sq(iOffset) + sq(jOffset));
+
+  // Số bước cần thiết để di chuyển theo cung tròn
+  int steps = 360;  // Bạn có thể điều chỉnh số bước này
+  float angleStep = 360.0 / steps;
+
+  // Cài đặt tốc độ và gia tốc cho các động cơ
+  setStepperProperties(stepperX1, mi, a);
+  setStepperProperties(stepperX2, mi, a);
+  setStepperProperties(stepperY, miY, aY);
+
+  for (int i = 0; i <= steps; i++) {
+    // Tính toán góc hiện tại
+    float angle = angleStep * i;
+
+    // Tính toán vị trí mới
+    float x = xCenter + radius * cos(radians(angle));
+    float y = yCenter + radius * sin(radians(angle));
+
+    // Cập nhật vị trí mục tiêu cho các động cơ
+    stepperX1.moveTo(x);
+    stepperX2.moveTo(x);
+    stepperY.moveTo(y);
+
+    // Di chuyển các động cơ đến vị trí mới
+
+    runSteppers();
+  }
+  stopAllSteppers();
+}
+
+void G3(float xEnd, float yEnd, float iOffset, float jOffset) {
+  xEnd = xEnd / D / 3.14 * mi;
+  yEnd = yEnd / D / 3.14 * miY;
+  iOffset = iOffset / D / 3.14 * mi;
+  jOffset = jOffset / D / 3.14 * miY;
+
+  float xStart = stepperX1.currentPosition();
+  float yStart = stepperY.currentPosition();
+  float xCenter = xStart + iOffset;
+  float yCenter = yStart + jOffset;
+
+  float radius = sqrt(sq(iOffset) + sq(jOffset));
+  int steps = 360;  // Số bước cần thiết để di chuyển theo cung tròn
+  float angleStep = 360.0 / steps;
+
+  setStepperProperties(stepperX1, mi, a);
+  setStepperProperties(stepperX2, mi, a);
+  setStepperProperties(stepperY, miY, aY);
+
+  for (int i = 0; i <= steps; i++) {
+    float angle = angleStep * i;
+    float x = xCenter + radius * cos(radians(-angle));
+    float y = yCenter + radius * sin(radians(-angle));
+
+    stepperX1.moveTo(x);
+    stepperX2.moveTo(x);
+    stepperY.moveTo(y);
+
+    runSteppers();
+  }
+  stopAllSteppers();
+}
+
+void G4(String command) {
+  // Tìm vị trí của ký tự 'P' và 'X'
+  int pIndex = command.indexOf('P');
+  int xIndex = command.indexOf('X');
+
+  // Nếu cả hai ký tự 'P' và 'X' không tồn tại, gọi hàm dừng khẩn cấp
+  if (pIndex == -1 && xIndex == -1) {
+    emergencyStop();
+    return;
+  }
+
+  // Xử lý tham số 'P' nếu có
+  if (pIndex != -1) {
+    // Trích xuất giá trị thời gian từ chuỗi sau ký tự 'P'
+    String timeStr = command.substring(pIndex + 1);
+    long timeMs = timeStr.toInt();  // Chuyển đổi chuỗi thành số nguyên
+
+    if (timeMs > 0) {
+      delay(timeMs);  // Dừng lại trong thời gian tính bằng milliseconds
+    } else {
+      Serial.println("Tham số 'P' không hợp lệ.");
+    }
+  }
+
+  // Xử lý tham số 'X' nếu có
+  if (xIndex != -1) {
+    // Trích xuất giá trị thời gian từ chuỗi sau ký tự 'X'
+    String timeStr = command.substring(xIndex + 1);
+    long timeSec = timeStr.toInt();  // Chuyển đổi chuỗi thành số nguyên
+
+    if (timeSec > 0) {
+      delay(timeSec * 1000);  // Dừng lại trong thời gian tính bằng giây
+    } else {
+      Serial.println("Tham số 'X' không hợp lệ.");
+    }
+  }
+}
+
+void G28() {
+  setStepperProperties(stepperX1, mi, a);
+  setStepperProperties(stepperX2, mi, a);
+  setStepperProperties(stepperY, miY, aY);
+  // Cập nhật vị trí mục tiêu cho các động cơ
+  stepperX1.moveTo(0);
+  stepperX2.moveTo(0);
+  stepperY.moveTo(0);
+
+  runSteppers();
+}
+
+void M30() {
+  G28();
+  G4("X10");
+  enableAllSteppers();
+  Serial.print("Process completed!");
+  while (true)
+    ;  // Dừng hoàn toàn chương trình
+}
+
+void autoHome() {
+  // Thiết lập tốc độ và gia tốc để di chuyển về vị trí home
+  setStepperProperties(stepperX1, mi, a);
+  setStepperProperties(stepperX2, mi, a);
+  setStepperProperties(stepperY, miY, aY);
+
+  // Di chuyển động cơ X1 và X2 về vị trí home
+  while (!limitSwitchTriggeredX) {
+    stepperX1.move(-mi * (n + 5));  // Di chuyển một khoảng đủ lớn để chạm công tắc hành trình
+    stepperX2.move(-mi * (n + 5));  // Di chuyển một khoảng đủ lớn để chạm công tắc hành trình
+    stepperX1.run();
+    stepperX2.run();
+  }
+
+  enableXSteppers();
+  resetStepperPosition(stepperX1, -offset);
+  resetStepperPosition(stepperX2, -offset);
+  disableXSteppers();
+
+  // Di chuyển động cơ Y về vị trí home
+  while (!limitSwitchTriggeredY) {
+    stepperY.move(-miY * (nY + 5));  // Di chuyển một khoảng đủ lớn để chạm công tắc hành trình
+    stepperY.run();
+  }
+
+  enableYSteppers();
+  resetStepperPosition(stepperY, -offset);
+  disableYSteppers();
+  // Di chuyển tất cả các động cơ đến vị trí 0
+  stepperX1.moveTo(0);
+  stepperX2.moveTo(0);
+  stepperY.moveTo(0);
+  while (stepperX1.distanceToGo() != 0 || stepperX2.distanceToGo() != 0 || stepperY.distanceToGo() != 0) {
+    stepperX1.run();
+    stepperX2.run();
+    stepperY.run();
+  }
+  // Đánh dấu hoàn thành quá trình homing
+  homingCompleteX = true;
+  homingCompleteY = true;
+}
+
+void checkX() {
+  if (!homingCompleteXX) {
+    stepperX1.disableOutputs();
+    stepperX2.disableOutputs();
+    // Thiết lập tốc độ và gia tốc để di chuyển về vị trí home
+    setStepperProperties(stepperX1, mi, a);
+    setStepperProperties(stepperX2, mi, a);
+
+    // Di chuyển động cơ X1 và X2 về vị trí home
+    while (!limitSwitchTriggeredXX) {
+      stepperX1.move(mi * (n + 5));  // Di chuyển một khoảng đủ lớn để chạm công tắc hành trình
+      stepperX2.move(mi * (n + 5));  // Di chuyển một khoảng đủ lớn để chạm công tắc hành trình
+      stepperX1.run();
+      stepperX2.run();
+    }
+
+    stepperX1.setSpeed(0);
+    stepperX2.setSpeed(0);
+    enableXSteppers();
+
+    Serial.print(stepperX1.currentPosition());
+    Serial.print(" - ");
+    Serial.print(stepperX2.currentPosition() / mi * D * 3.14);
+    Serial.print("mm => ");
+    if (stepperX1.currentPosition() >= 99322)
+      Serial.println("Done");
+
+    disableXSteppers();
+
+    stepperX1.move(-offset);
+    stepperX2.move(-offset);
+
+    while (stepperX1.distanceToGo() != 0 || stepperX2.distanceToGo() != 0) {
+      stepperX1.run();
+      stepperX2.run();
+    }
+
+    stopAllSteppers();
+    // Đánh dấu hoàn thành quá trình checking
+    homingCompleteXX = true;
+  }
+}
+
+void checkY() {
+  if (!homingCompleteYY) {
+    // Bật động cơ
+    stepperY.disableOutputs();
+
+    // Thiết lập tốc độ và gia tốc để di chuyển về vị trí home
+    setStepperProperties(stepperY, miY, aY);
+
+    // Di chuyển động cơ Y về vị trí home
+    while (!limitSwitchTriggeredYY) {
+      stepperY.move(miY * (nY + 5));  // Di chuyển một khoảng đủ lớn để chạm công tắc hành trình
+      stepperY.run();
+    }
+
+    stepperY.setSpeed(0);
+    enableYSteppers();
+
+    Serial.print(stepperY.currentPosition());
+    Serial.print(" - ");
+    Serial.print(stepperY.currentPosition() / miY * D * 3.14);
+    Serial.print("mm => ");
+    if (stepperY.currentPosition() >= 70252)
+      Serial.println("Done");
+
+    disableYSteppers();
+    stepperY.move(-offset);
+
+    while (stepperY.distanceToGo() != 0) {
+      stepperY.run();
+    }
+    stopAllSteppers();
+    // Đánh dấu hoàn thành quá trình checking
+    homingCompleteYY = true;
+  }
+}
+
+void disableAllSteppers() {
+  stepperX1.disableOutputs();
+  stepperX2.disableOutputs();
+  stepperY.disableOutputs();
+}
+
+void disableXSteppers() {
+  stepperX1.disableOutputs();
+  stepperX2.disableOutputs();
+}
+
+void disableYSteppers() {
+  stepperY.disableOutputs();
+}
+
+void emergencyStop() {
+  unsigned long currentMillis = millis();
+  if ((digitalRead(limitSwitchX) == LOW && (currentMillis - lastDebounceTimeX) > debounceDelayX) || (digitalRead(limitSwitchY) == LOW && (currentMillis - lastDebounceTimeY) > debounceDelayY) || (digitalRead(limitSwitchXX) == LOW && (currentMillis - lastDebounceTimeXX) > debounceDelayXX) || (digitalRead(limitSwitchYY) == LOW && (currentMillis - lastDebounceTimeYY) > debounceDelayYY)) {
+    handleEmergencyStop();
+  }
+}
+
+void enableAllSteppers() {
+  stepperX1.enableOutputs();
+  stepperX2.enableOutputs();
+  stepperY.enableOutputs();
+}
+
+void enableXSteppers() {
+  stepperX1.enableOutputs();
+  stepperX2.enableOutputs();
+}
+
+void enableYSteppers() {
+  stepperY.enableOutputs();
+}
+
+void handleEmergencyStop() {
+  enableAllSteppers();
+  stopAllSteppers();
+  Serial.println("Emergency Stop Activated");
+
+  Serial.println("Continue program? (Y/N)");
+  while (!Serial.available())
+    ;  // Chờ cho người dùng nhập dữ liệu
+  char input = Serial.read();
+
+  if (input == 'Y' || input == 'y') {
+    Serial.println("Resuming program from the beginning...");
+    resetSystem();  // Khởi động lại chương trình
+  } else if (input == 'N' || input == 'n') {
+    Serial.println("Stopping program completely.");
+    while (true)
+      ;  // Dừng hoàn toàn chương trình
+
+  } else {
+    Serial.println("Invalid input. Stopping program.");
+    while (true)
+      ;  // Dừng hoàn toàn chương trình nếu đầu vào không hợp lệ
+  }
+}
+
+void resetStepperPosition(AccelStepper &stepper, int position) {
+  stepper.setCurrentPosition(position);
+  stepper.moveTo(0);
+}
+
+void resetSystem() {
+  // Vô hiệu hóa tất cả động cơ
+  enableAllSteppers();
+
+  // Khởi động lại hệ thống từ đầu
+  setup();  // Gọi lại hàm setup để khởi động lại chương trình
+}
+
+void moveToPosition(int position) {
+  stepperX1.moveTo(position);
+  stepperX2.moveTo(position);
+  stepperY.moveTo(position);
+  runSteppers();
+}
+
+void runSteppers() {
+  while (stepperX1.distanceToGo() != 0 || stepperX2.distanceToGo() != 0 || stepperY.distanceToGo() != 0) {
+    emergencyStop();
+    stepperX1.run();
+    stepperX2.run();
+    stepperY.run();
+    emergencyStop();
+  }
+}
+
+void safe() {
+  // Bật động cơ
+  disableAllSteppers();
+  setStepperProperties(stepperX1, mi, a);
+  setStepperProperties(stepperX2, mi, a);
+  setStepperProperties(stepperY, miY, aY);
+  if (digitalRead(limitSwitchXX) == LOW) {
+    stepperX1.move(-mi / 38);  // Di chuyển một khoảng đủ lớn để chạm công tắc hành trình
+    stepperX2.move(-mi / 38);  // Di chuyển một khoảng đủ lớn để chạm công tắc hành trình
+  } else {
+    stepperX1.move(mi / 38);  // Di chuyển một khoảng đủ lớn để chạm công tắc hành trình
+    stepperX2.move(mi / 38);  // Di chuyển một khoảng đủ lớn để chạm công tắc hành trình
+  }
+  if (digitalRead(limitSwitchYY) == LOW) {
+    stepperY.move(-miY / 38);
+  } else {
+    stepperY.move(miY / 38);
+  }
+  while (stepperX1.distanceToGo() != 0 || stepperX2.distanceToGo() != 0 || stepperY.distanceToGo() != 0) {
+    stepperX1.run();
+    stepperX2.run();
+    stepperY.run();
+  }
+  stopAllSteppers();
+}
+
+void setStepperProperties(AccelStepper &stepper, int speed, int accel) {
+  stepper.setMaxSpeed(speed);
+  stepper.setAcceleration(speed / accel);
+}
+
+void stopAllSteppers() {
+  stepperX1.stop();
+  stepperX2.stop();
+  stepperY.stop();
+  stepperX1.setSpeed(0);
+  stepperX2.setSpeed(0);
+  stepperY.setSpeed(0);
+}
+
+void stopSteppersX() {
+  stepperX1.stop();
+  stepperX2.stop();
+}
+
+void stopStepperY() {
+  stepperY.stop();
+}
