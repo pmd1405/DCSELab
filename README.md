@@ -2,7 +2,7 @@
 Giúp máy tính nhận diện màu sắc là một bài toán rất thú vị và cũng không kém phần quan trọng trong mảng thị giác máy tính. Ở trong dự án này mình sẽ xây dựng một ứng dụng nhận diện màu sắc từ camera với độ chính xác rất cao.
 
 <p align="center">
-	<img src="https://github.com/KudoKhang/ColorDetector/blob/main/colordetection.gif?raw=true" />
+	<img src="https://github.com/pmd1405/pmd1405.github.io/blob/main/Beluga_d.png" />
 </p>
 
 
